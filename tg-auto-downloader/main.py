@@ -46,6 +46,8 @@ class DaemonController:
         self.current_download_msg_id = None
         self.current_download_task = None
         self.cancel_reasons = {}
+        self._last_status_write_ts = 0.0
+        self._last_status_digest = None
 
     def _spawn_ui_subprocess(self, args: list):
         cmd = get_launch_command_args(args)
@@ -60,7 +62,7 @@ class DaemonController:
     def launch_gui(self, tab: str = "status"):
         if self._gui_process is not None and self._gui_process.poll() is None:
             self._raise_gui_ts = time.time()
-            self._write_status_snapshot()
+            self._write_status_snapshot(force=True)
             return
         try:
             self._gui_process = self._spawn_ui_subprocess(["--gui", "--tab", tab])
@@ -98,26 +100,53 @@ class DaemonController:
             return "unconfigured"
         return "idle"
 
-    def _write_status_snapshot(self):
+    def _write_status_snapshot(self, force: bool = False):
         connected = bool(
             self.tg_service
             and self.tg_service.client
             and self.tg_service.client.is_connected()
             and self.tg_service.account_label
         )
+        items = self.queue_service.get_serializable_items()
+        pending_count = self.queue_service.get_pending_count()
+        account = self.tg_service.account_label if self.tg_service else ""
+        last_error = self.tg_service.last_error if self.tg_service else ""
+        has_active_download = any(i.get("status") == "下載中" for i in items)
+
+        digest = (
+            connected,
+            self.client_active,
+            account,
+            last_error,
+            self.has_encrypted_warning,
+            pending_count,
+            self._raise_gui_ts,
+            tuple((i["msg_id"], i["status"], i["progress"], i["speed"], i["eta"], i["is_completed"]) for i in items),
+        )
+
+        now = time.time()
+        elapsed = now - self._last_status_write_ts
+        changed = digest != self._last_status_digest
+        min_interval = 0.5 if has_active_download else 2.0
+        if not force and not changed and elapsed < min_interval:
+            return
+
+        self._last_status_digest = digest
+        self._last_status_write_ts = now
+
         payload = {
             "version": "3.3",
-            "timestamp": time.time(),
+            "timestamp": now,
             "raise_gui_ts": self._raise_gui_ts,
             "pid": os.getpid(),
             "memory_mb": round(get_memory_usage_mb(), 1),
             "client_active": self.client_active,
             "connected": connected,
-            "account": self.tg_service.account_label if self.tg_service else "",
-            "last_error": self.tg_service.last_error if self.tg_service else "",
+            "account": account,
+            "last_error": last_error,
             "has_encrypted_warning": self.has_encrypted_warning,
-            "pending_count": self.queue_service.get_pending_count(),
-            "items": self.queue_service.get_serializable_items(),
+            "pending_count": pending_count,
+            "items": items,
         }
         try:
             atomic_write_json(self.file_service.status_path, payload)
@@ -544,7 +573,7 @@ class DaemonController:
 
                 async def watch_tg_deletion():
                     while not self.current_download_task.done() and not self.stop_event.is_set():
-                        await asyncio.sleep(5)
+                        await asyncio.sleep(15)
                         if self.current_download_task.done() or not self.tg_service or not self.client_active:
                             break
                         exists = await self.tg_service.check_message_exists(msg_id, chat_target=chat_target)
@@ -605,25 +634,21 @@ class DaemonController:
                 final_dest = ""
 
                 if is_zip:
-                    is_encrypted = False
-                    try:
-                        with zipfile.ZipFile(dest_path) as zf:
-                            for info in zf.infolist():
-                                if info.flag_bits & 0x1:
-                                    is_encrypted = True
-                                    break
-                    except Exception:
-                        is_encrypted = True
+                    def _process_zip_sync():
+                        encrypted = False
+                        try:
+                            with zipfile.ZipFile(dest_path) as zf:
+                                for info in zf.infolist():
+                                    if info.flag_bits & 0x1:
+                                        encrypted = True
+                                        break
+                        except Exception:
+                            encrypted = True
+                        if encrypted:
+                            return "encrypted", ""
 
-                    if is_encrypted:
-                        self.has_encrypted_warning = True
-                        self.queue_service.update_item(msg_id, status="⚠️ 加密隔離", eta="--")
-                        self.notify(APP_DISPLAY_NAME, f"發現加密 ZIP 檔，已隔離保留：{target['name']}")
-                        continue
-
-                    folder_name = os.path.splitext(target["name"])[0]
-                    extract_dir = os.path.join(self.file_service.get_download_dir(), folder_name)
-                    try:
+                        folder_name = os.path.splitext(target["name"])[0]
+                        extract_dir = os.path.join(self.file_service.get_download_dir(), folder_name)
                         if os.path.exists(extract_dir):
                             self.file_service.safe_delete(extract_dir)
                         with zipfile.ZipFile(dest_path) as zf:
@@ -633,26 +658,39 @@ class DaemonController:
                             if os.path.exists(dest_folder):
                                 self.file_service.safe_delete(dest_folder)
                             shutil.move(extract_dir, dest_folder)
-                        final_dest = dest_folder
+                        return "ok", dest_folder
+
+                    try:
+                        zip_state, final_dest = await asyncio.to_thread(_process_zip_sync)
                     except Exception as e:
                         print(f"[-] ZIP 解壓縮或搬移失敗 {target['name']}: {e}")
                         self.queue_service.update_item(msg_id, status="解壓/移轉失敗", eta="--")
                         continue
+
+                    if zip_state == "encrypted":
+                        self.has_encrypted_warning = True
+                        self.queue_service.update_item(msg_id, status="⚠️ 加密隔離", eta="--")
+                        self.notify(APP_DISPLAY_NAME, f"發現加密 ZIP 檔，已隔離保留：{target['name']}")
+                        continue
                 else:
-                    try:
+                    def _move_regular_sync():
                         dest_file = os.path.join(shipping_dir, target["name"])
                         if os.path.abspath(dest_path) != os.path.abspath(dest_file):
                             if os.path.exists(dest_file):
                                 self.file_service.safe_delete(dest_file)
                             shutil.move(dest_path, dest_file)
-                        final_dest = dest_file
+                        return dest_file
+
+                    try:
+                        final_dest = await asyncio.to_thread(_move_regular_sync)
                     except Exception as e:
                         print(f"[-] 搬移失敗 {target['name']}: {e}")
                         self.queue_service.update_item(msg_id, status="移轉失敗", eta="--")
                         continue
 
                 expected_size = -1 if is_zip else target["size"]
-                if self.file_service.verify_moved_file(final_dest, expected_size):
+                verified = await asyncio.to_thread(self.file_service.verify_moved_file, final_dest, expected_size)
+                if verified:
                     if self.file_service.delete_after_transfer and self.tg_service:
                         deleted = await self.tg_service.delete_message(msg_id, chat_target=chat_target)
                         status_label = "已完成並清理" if deleted else "已完成移轉(無刪除權限)"
@@ -660,7 +698,7 @@ class DaemonController:
                         status_label = "已完成移轉"
 
                     if is_zip and os.path.exists(dest_path):
-                        self.file_service.safe_delete(dest_path)
+                        await asyncio.to_thread(self.file_service.safe_delete, dest_path)
 
                     self.queue_service.mark_completed(msg_id, status_label=status_label)
                     self.queue_service.remove_item(msg_id)
@@ -676,7 +714,7 @@ class DaemonController:
     async def async_main(self):
         self.stop_event = asyncio.Event()
         await self.start_tg_client()
-        self._write_status_snapshot()
+        self._write_status_snapshot(force=True)
         await asyncio.gather(
             self.queue_worker(),
             self.status_and_command_loop(),

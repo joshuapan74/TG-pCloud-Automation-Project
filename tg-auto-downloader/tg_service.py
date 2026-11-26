@@ -599,8 +599,8 @@ class TelegramService:
                 final_size = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
                 if final_size == total_size:
                     return True
-                self.log.warning(f"整檔驗證第 {attempt + 1}/3 次未通過 ({final_size}/{total_size})，2s 後複檢...")
-                await asyncio.sleep(2)
+                self.log.warning(f"整檔驗證第 {attempt + 1}/3 次未通過 ({final_size}/{total_size})，0.5s 後複檢...")
+                await asyncio.sleep(0.5)
             return False
         return ok
 
@@ -686,19 +686,18 @@ class TelegramService:
                     if os.path.exists(part_path):
                         async with aiofiles.open(part_path, "rb") as pf:
                             while True:
-                                buf = await pf.read(4 * 1024 * 1024)
+                                buf = await pf.read(8 * 1024 * 1024)
                                 if not buf:
                                     break
                                 await out.write(buf)
 
-            await asyncio.sleep(3)
             for attempt in range(3):
                 final_size = os.path.getsize(dest_path)
                 if final_size == total_size:
                     shutil.rmtree(parts_dir, ignore_errors=True)
                     return
                 self.log.warning(f"整檔驗證第 {attempt + 1}/3 次未通過 ({final_size}/{total_size})...")
-                await asyncio.sleep(2)
+                await asyncio.sleep(0.5)
             raise RuntimeError("整檔大小驗證失敗")
 
         success = await self._run_with_watchdog(do_multipart, lambda: last_prog_t, message.id)

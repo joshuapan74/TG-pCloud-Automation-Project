@@ -276,6 +276,8 @@ class ControlPanelApp:
         self._daemon_alive = False
         self._daemon_version = ""
         self._last_raise_ts = float(read_json_safe(self.file_service.status_path, {}).get("raise_gui_ts", 0) or 0)
+        self._last_config_mtime = self._get_config_mtime()
+        self._last_items_snapshot = None
         self._row_widgets = {}
         self._empty_row_label = None
 
@@ -1282,13 +1284,19 @@ class ControlPanelApp:
                     command=lambda m=mid, nm=raw_name: self._on_cancel_task(m, nm),
                 )
 
+    def _get_config_mtime(self) -> float:
+        try:
+            return os.path.getmtime(self.file_service.config_path)
+        except OSError:
+            return 0.0
+
     def _poll_status(self):
         if self._closing:
             return
         status = read_json_safe(self.file_service.status_path, {})
         now = time.time()
         ts = float(status.get("timestamp", 0) or 0)
-        alive = (now - ts) <= 4.0
+        alive = (now - ts) <= 5.5
         self._daemon_alive = alive
         self._daemon_version = str(status.get("version", "") or "")
 
@@ -1297,7 +1305,10 @@ class ControlPanelApp:
             self._last_raise_ts = raise_ts
             self._ensure_visible()
 
-        self.file_service.load_config()
+        cfg_mtime = self._get_config_mtime()
+        if cfg_mtime != self._last_config_mtime:
+            self._last_config_mtime = cfg_mtime
+            self.file_service.load_config()
         has_creds = all(self.file_service.get_credentials())
         has_session = self.file_service.has_session_file()
 
@@ -1333,8 +1344,11 @@ class ControlPanelApp:
         else:
             self.warning_var.set("")
 
-        self._sync_queue_rows(status.get("items", []))
-        self.root.after(800, self._poll_status)
+        items = status.get("items", [])
+        if items != self._last_items_snapshot:
+            self._last_items_snapshot = items
+            self._sync_queue_rows(items)
+        self.root.after(1000, self._poll_status)
 
     def _on_close(self):
         self._confirm_close_app()

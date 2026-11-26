@@ -1,4 +1,4 @@
-"""Apple-inspired Tkinter Control Panel, Chat Picker, and Setup Wizard."""
+"""Apple-inspired Tkinter Control Panel, Chat Picker, Queue Controls, and Setup Wizard."""
 
 import asyncio
 import os
@@ -45,7 +45,7 @@ TEXT_SECONDARY = "#6E6E73"
 APPLE_BLUE = "#007AFF"
 APPLE_BLUE_HOVER = "#0062CC"
 APPLE_GREEN = "#28CD41"
-APPLE_AMBER = "#FF9F0A"
+APPLE_AMBER = "#D97706"
 APPLE_RED = "#FF3B30"
 BTN_SECONDARY_BG = "#E9E9EE"
 BTN_SECONDARY_HOVER = "#DCDCE4"
@@ -70,7 +70,7 @@ def _apply_window_icon(root: tk.Tk):
         pass
 
 
-def _make_apple_button(parent, text: str, command, primary: bool = False, danger: bool = False, width=None):
+def _make_apple_button(parent, text: str, command, primary: bool = False, danger: bool = False, compact: bool = False, width=None):
     """Create a clean flat Apple-styled button with subtle hover feedback."""
     if primary:
         bg, fg, hover = APPLE_BLUE, "#FFFFFF", APPLE_BLUE_HOVER
@@ -90,9 +90,9 @@ def _make_apple_button(parent, text: str, command, primary: bool = False, danger
         relief="flat",
         bd=0,
         cursor="hand2",
-        font=(UI_FONT, 10, "bold" if primary else "normal"),
-        padx=14,
-        pady=6,
+        font=(UI_FONT, 9 if compact else 10, "bold" if primary else "normal"),
+        padx=8 if compact else 14,
+        pady=3 if compact else 6,
     )
     if width:
         btn.config(width=width)
@@ -111,7 +111,6 @@ def _make_apple_button(parent, text: str, command, primary: bool = False, danger
 
 
 def _make_card(parent, title: str = ""):
-    """Create an elevated white card container with hairline border."""
     outer = tk.Frame(
         parent,
         bg=BG_CARD,
@@ -253,9 +252,9 @@ class _AsyncLoginBridge:
 
 
 class ControlPanelApp:
-    """Apple-styled Control Panel providing Telegram login, chat/folder selection, and queue status."""
+    """Apple-styled Control Panel with tray minimize, exit confirmation, and per-task controls."""
 
-    def __init__(self, initial_tab: str = "account"):
+    def __init__(self, initial_tab: str = "status"):
         if sys.platform == "win32":
             try:
                 import ctypes
@@ -270,29 +269,22 @@ class ControlPanelApp:
         self.root.title(APP_DISPLAY_NAME)
         self.root.configure(bg=BG_CANVAS)
         self.root.resizable(False, False)
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.protocol("WM_DELETE_WINDOW", self._confirm_close_app)
         _apply_window_icon(self.root)
 
+        self._closing = False
         self._daemon_alive = False
         self._daemon_version = ""
+        self._last_raise_ts = float(read_json_safe(self.file_service.status_path, {}).get("raise_gui_ts", 0) or 0)
+        self._row_widgets = {}
+        self._empty_row_label = None
+
         self._build_styles()
         self._build_ui(initial_tab)
         self._fit_fixed_window(initial_tab)
         self._ensure_visible()
+        self.root.bind("<Unmap>", self._on_window_unmap)
         self._poll_status()
-
-    def _fit_fixed_window(self, initial_tab: str):
-        """Measure all tabs and lock the window to an exact compact non-resizable size."""
-        max_w, max_h = 760, 480
-        for key in self._tab_frames:
-            self._select_tab(key)
-            self.root.update_idletasks()
-            max_w = max(max_w, self.root.winfo_reqwidth())
-            max_h = max(max_h, self.root.winfo_reqheight())
-        self._select_tab(initial_tab if initial_tab in self._tab_frames else "account")
-        self.root.update_idletasks()
-        self.root.geometry(f"{max_w}x{max_h}")
-        self.root.resizable(False, False)
 
     def _ensure_visible(self):
         self.root.update_idletasks()
@@ -304,6 +296,19 @@ class ControlPanelApp:
         except Exception:
             pass
         self.root.focus_force()
+
+    def _fit_fixed_window(self, initial_tab: str):
+        """Measure all tabs and lock the window to an exact compact non-resizable size."""
+        max_w, max_h = 780, 480
+        for key in self._tab_frames:
+            self._select_tab(key)
+            self.root.update_idletasks()
+            max_w = max(max_w, self.root.winfo_reqwidth())
+            max_h = max(max_h, self.root.winfo_reqheight())
+        self._select_tab(initial_tab if initial_tab in self._tab_frames else "status")
+        self.root.update_idletasks()
+        self.root.geometry(f"{max_w}x{max_h}")
+        self.root.resizable(False, False)
 
     def _build_styles(self):
         style = ttk.Style()
@@ -343,8 +348,60 @@ class ControlPanelApp:
                 return
             time.sleep(0.2)
 
+    def _on_window_unmap(self, event):
+        """Minimize button (_) hides to system tray background execution."""
+        if event.widget is self.root and not self._closing:
+            try:
+                if self.root.state() == "iconic" and self._daemon_alive:
+                    self._send_daemon_command("notify_minimized")
+                    self._destroy_gui_only()
+            except Exception:
+                pass
+
+    def _confirm_close_app(self):
+        """Close button (X) prompts confirmation and pauses active downloads before shutting down app."""
+        status = read_json_safe(self.file_service.status_path, {})
+        items = status.get("items", [])
+        has_downloading = any(i.get("status") == "下載中" for i in items)
+
+        if has_downloading:
+            prompt = (
+                "目前仍有檔案正在下載中。\n\n"
+                "確定要關閉整個程式嗎？\n"
+                "（程式會先自動暫停下載並保留斷點進度，再安全結束。）"
+            )
+        else:
+            prompt = "確定要關閉並結束 TG Auto Downloader 嗎？\n（若只是要縮小到系統匣背景執行，請按右上角「—」縮小鍵。）"
+
+        if not messagebox.askyesno("確認關閉程式", prompt, parent=self.root):
+            return
+
+        self._closing = True
+        if self._daemon_alive:
+            self._send_daemon_command("pause_and_quit")
+            deadline = time.time() + 4.5
+            while time.time() < deadline:
+                cur = read_json_safe(self.file_service.status_path, {})
+                cur_ts = float(cur.get("timestamp", 0) or 0)
+                if not cur.get("client_active", False) and not any(
+                    i.get("status") == "下載中" for i in cur.get("items", [])
+                ):
+                    time.sleep(0.25)
+                    break
+                if time.time() - cur_ts > 2.5:
+                    break
+                time.sleep(0.2)
+        self._destroy_gui_only()
+
+    def _destroy_gui_only(self):
+        self._closing = True
+        self.login_bridge.shutdown()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
     def _build_ui(self, initial_tab: str):
-        # Top Header Bar
         header = tk.Frame(self.root, bg=BG_CANVAS, padx=18, pady=10)
         header.pack(fill="x")
 
@@ -363,7 +420,7 @@ class ControlPanelApp:
         ).pack(anchor="w")
         tk.Label(
             title_col,
-            text="Telegram 雲端檔案自動下載與同步資料夾助手",
+            text="按「—」縮至系統匣背景執行（雙擊圖示重開）｜按「✕」完全關閉程式",
             bg=BG_CANVAS,
             fg=TEXT_SECONDARY,
             font=(UI_FONT, 9),
@@ -380,7 +437,6 @@ class ControlPanelApp:
         )
         self.status_pill.pack(side="right")
 
-        # Apple-style Segmented Tab Control
         seg_wrap = tk.Frame(self.root, bg=BG_CANVAS, padx=18)
         seg_wrap.pack(fill="x", pady=(0, 8))
         seg_bar = tk.Frame(seg_wrap, bg="#E5E5EA", padx=3, pady=3)
@@ -393,7 +449,7 @@ class ControlPanelApp:
             ("settings", "2. 對話框與同步設定"),
             ("status", "3. 下載佇列與狀態"),
         ]
-        for idx, (key, label) in enumerate(tabs):
+        for key, label in tabs:
             btn = tk.Button(
                 seg_bar,
                 text=label,
@@ -422,7 +478,7 @@ class ControlPanelApp:
         self._build_account_tab()
         self._build_settings_tab()
         self._build_status_tab()
-        self._select_tab(initial_tab if initial_tab in self._tab_frames else "account")
+        self._select_tab(initial_tab if initial_tab in self._tab_frames else "status")
 
     def _select_tab(self, tab_key: str):
         for key, frame in self._tab_frames.items():
@@ -437,7 +493,7 @@ class ControlPanelApp:
 
     def _build_account_tab(self):
         c_state, inner_state = _make_card(self.tab_account, "目前連線與帳號狀態")
-        c_state.pack(fill="x", pady=(0, 12))
+        c_state.pack(fill="x", pady=(0, 10))
 
         self.account_state_var = tk.StringVar(value="檢查中...")
         tk.Label(
@@ -450,7 +506,7 @@ class ControlPanelApp:
         _make_apple_button(inner_state, "登出目前帳號", self._on_logout, danger=True).pack(side="right")
 
         c_cred, inner_cred = _make_card(self.tab_account, "步驟 A：Telegram API 憑證（僅存於本機個人設定目錄）")
-        c_cred.pack(fill="x", pady=(0, 12))
+        c_cred.pack(fill="x", pady=(0, 10))
 
         r0 = tk.Frame(inner_cred, bg=BG_CARD)
         r0.pack(fill="x", pady=4)
@@ -481,10 +537,10 @@ class ControlPanelApp:
         ).pack(side="left")
 
         c_login, inner_login = _make_card(self.tab_account, "步驟 B：手機號碼與驗證碼登入（支援 2FA）")
-        c_login.pack(fill="x", pady=(0, 10))
+        c_login.pack(fill="x", pady=(0, 8))
 
         rp = tk.Frame(inner_login, bg=BG_CARD)
-        rp.pack(fill="x", pady=5)
+        rp.pack(fill="x", pady=4)
         tk.Label(rp, text="手機號碼（含國碼）", width=16, anchor="w", bg=BG_CARD, fg=TEXT_SECONDARY, font=(UI_FONT, 10)).pack(side="left")
         self.phone_var = tk.StringVar()
         tk.Entry(
@@ -496,7 +552,7 @@ class ControlPanelApp:
         tk.Label(rp, text="例：+886912345678", bg=BG_CARD, fg=TEXT_SECONDARY, font=(UI_FONT, 9)).pack(side="left", padx=10)
 
         rc = tk.Frame(inner_login, bg=BG_CARD)
-        rc.pack(fill="x", pady=5)
+        rc.pack(fill="x", pady=4)
         tk.Label(rc, text="Telegram 驗證碼", width=16, anchor="w", bg=BG_CARD, fg=TEXT_SECONDARY, font=(UI_FONT, 10)).pack(side="left")
         self.code_var = tk.StringVar()
         self.entry_code = tk.Entry(
@@ -509,7 +565,7 @@ class ControlPanelApp:
         self.btn_verify_code.pack(side="left")
 
         r2 = tk.Frame(inner_login, bg=BG_CARD)
-        r2.pack(fill="x", pady=5)
+        r2.pack(fill="x", pady=4)
         tk.Label(r2, text="2FA 兩步驟密碼", width=16, anchor="w", bg=BG_CARD, fg=TEXT_SECONDARY, font=(UI_FONT, 10)).pack(side="left")
         self.pwd_var = tk.StringVar()
         self.entry_pwd = tk.Entry(
@@ -527,7 +583,7 @@ class ControlPanelApp:
         tk.Label(
             self.tab_account, textvariable=self.login_feedback_var, bg=BG_CANVAS, fg=TEXT_SECONDARY,
             font=(UI_FONT, 9), wraplength=740, justify="left"
-        ).pack(anchor="w", pady=4)
+        ).pack(anchor="w", pady=2)
 
     def _on_send_code(self):
         ok, msg = self.file_service.set_credentials(self.api_id_var.get(), self.api_hash_var.get())
@@ -666,7 +722,6 @@ class ControlPanelApp:
     # ─── Tab 2: Target Dialog, Sync Folder & Preferences ─────────────────────
 
     def _build_settings_tab(self):
-        # Card 1: Target Telegram Chat / Dialog
         c_chat, inner_chat = _make_card(self.tab_settings, "監聽抓取的 Telegram 對話框")
         c_chat.pack(fill="x", pady=(0, 8))
 
@@ -681,15 +736,11 @@ class ControlPanelApp:
             font=(UI_FONT, 10, "bold"), padx=10, pady=4
         ).pack(side="left", padx=(4, 10))
         _make_apple_button(row_chat, "從清單選擇...", self._open_chat_picker, primary=True).pack(side="right")
-        _make_apple_button(
-            row_chat, "重設為我的收藏", self._reset_watch_chat
-        ).pack(side="right", padx=(0, 8))
+        _make_apple_button(row_chat, "重設為我的收藏", self._reset_watch_chat).pack(side="right", padx=(0, 8))
 
         row_paste = tk.Frame(inner_chat, bg=BG_CARD)
         row_paste.pack(fill="x", pady=(0, 4))
-        tk.Label(
-            row_paste, text="貼上位置：", bg=BG_CARD, fg=TEXT_SECONDARY, font=(UI_FONT, 10)
-        ).pack(side="left")
+        tk.Label(row_paste, text="貼上位置：", bg=BG_CARD, fg=TEXT_SECONDARY, font=(UI_FONT, 10)).pack(side="left")
         self.chat_paste_var = tk.StringVar()
         tk.Entry(
             row_paste, textvariable=self.chat_paste_var, bg=BG_SUBTLE, fg=TEXT_PRIMARY,
@@ -712,7 +763,6 @@ class ControlPanelApp:
             bg=BG_CARD, fg=TEXT_PRIMARY, activebackground=BG_CARD, selectcolor=BG_CARD, font=(UI_FONT, 9),
         ).pack(anchor="w")
 
-        # Card 2: Folders
         c_dir, inner_dir = _make_card(self.tab_settings, "資料夾路徑設定")
         c_dir.pack(fill="x", pady=(0, 8))
 
@@ -744,7 +794,6 @@ class ControlPanelApp:
         ).pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=3)
         _make_apple_button(row_dl, "選擇資料夾...", self._browse_download_dir).pack(side="right")
 
-        # Card 3: Automation Preferences
         c_pref, inner_pref = _make_card(self.tab_settings, "自動化行為偏好")
         c_pref.pack(fill="x", pady=(0, 8))
 
@@ -794,8 +843,8 @@ class ControlPanelApp:
             messagebox.showwarning("請先登入", "請先完成 Telegram 登入，才能驗證與解析對話框。", parent=self.root)
             return
 
-        if self._daemon_alive and self._daemon_version != "3.2":
-            messagebox.showwarning("請重啟背景服務", "偵測到舊版背景服務仍在運作，請先從系統匣「結束程式」後重新開啟。", parent=self.root)
+        if self._daemon_alive and self._daemon_version != "3.3":
+            messagebox.showwarning("請重啟背景服務", "偵測到舊版背景服務仍在運作，請先按「✕」完全關閉後重開。", parent=self.root)
             return
 
         self.btn_resolve_chat.config(state="disabled")
@@ -848,8 +897,8 @@ class ControlPanelApp:
             messagebox.showwarning("請先登入", "請先在「1. Telegram 帳號登入」完成登入後，再讀取對話框清單。", parent=self.root)
             return
 
-        if self._daemon_alive and self._daemon_version != "3.2":
-            messagebox.showwarning("請重啟背景服務", "偵測到舊版背景服務仍在運作，請先從系統匣「結束程式」後重新開啟。", parent=self.root)
+        if self._daemon_alive and self._daemon_version != "3.3":
+            messagebox.showwarning("請重啟背景服務", "偵測到舊版背景服務仍在運作，請先按「✕」完全關閉後重開。", parent=self.root)
             return
 
         modal = tk.Toplevel(self.root)
@@ -866,11 +915,10 @@ class ControlPanelApp:
         tk.Label(top, text="搜尋對話框", bg=BG_CANVAS, fg=TEXT_SECONDARY, font=(UI_FONT, 9)).pack(anchor="w")
 
         search_var = tk.StringVar()
-        search_entry = tk.Entry(
+        tk.Entry(
             top, textvariable=search_var, bg=BG_CARD, fg=TEXT_PRIMARY,
             relief="flat", font=(UI_FONT, 10), highlightthickness=1, highlightbackground=BORDER_HAIRLINE
-        )
-        search_entry.pack(fill="x", pady=(4, 0), ipady=5)
+        ).pack(fill="x", pady=(4, 0), ipady=5)
 
         body = tk.Frame(modal, bg=BG_CANVAS, padx=16)
         body.pack(fill="both", expand=True)
@@ -1002,11 +1050,11 @@ class ControlPanelApp:
         self.settings_msg_var.set("✓ 設定已儲存並套用。")
         messagebox.showinfo("儲存成功", "設定已更新並通知背景服務套用。", parent=self.root)
 
-    # ─── Tab 3: Queue & System Status ────────────────────────────────────────
+    # ─── Tab 3: Queue & System Status (with Pause/Resume & Cancel per row) ───
 
     def _build_status_tab(self):
         c_sys, inner_sys = _make_card(self.tab_status, "系統健康看板")
-        c_sys.pack(fill="x", pady=(0, 12))
+        c_sys.pack(fill="x", pady=(0, 8))
 
         self.daemon_info_var = tk.StringVar(value="等待背景服務回報...")
         tk.Label(
@@ -1019,23 +1067,52 @@ class ControlPanelApp:
             inner_sys, textvariable=self.warning_var, bg=BG_CARD, fg=APPLE_RED, font=(UI_FONT, 9, "bold")
         ).pack(anchor="w", pady=(4, 0))
 
-        c_q, inner_q = _make_card(self.tab_status, "下載任務與近期歷史（重啟自動保留續傳）")
-        c_q.pack(fill="both", expand=True, pady=(0, 10))
+        c_q, inner_q = _make_card(self.tab_status, "下載任務與近期歷史（可暫停 / 繼續 / 取消下載）")
+        c_q.pack(fill="both", expand=True, pady=(0, 8))
 
-        cols = ("name", "size", "progress", "speed", "eta", "status")
-        self.tree = ttk.Treeview(inner_q, columns=cols, show="headings", height=7, style="Apple.Treeview")
-        headers = {
-            "name": ("檔案名稱", 220),
-            "size": ("大小", 80),
-            "progress": ("進度", 65),
-            "speed": ("速度", 85),
-            "eta": ("剩餘", 65),
-            "status": ("狀態", 145),
-        }
-        for key, (label, width) in headers.items():
-            self.tree.heading(key, text=label)
-            self.tree.column(key, width=width, anchor="w" if key in ("name", "status") else "center")
-        self.tree.pack(fill="both", expand=True)
+        # Fixed column header bar
+        hdr = tk.Frame(inner_q, bg=BG_SUBTLE, padx=8, pady=5)
+        hdr.pack(fill="x")
+        cols_spec = [
+            ("檔案名稱", 24),
+            ("大小", 9),
+            ("進度", 7),
+            ("速度 / 剩餘", 15),
+            ("狀態", 14),
+            ("操作", 12),
+        ]
+        for label, w in cols_spec:
+            tk.Label(
+                hdr, text=label, width=w, anchor="w" if label == "檔案名稱" else "center",
+                bg=BG_SUBTLE, fg=TEXT_SECONDARY, font=(UI_FONT, 9, "bold"),
+            ).pack(side="left", padx=2)
+
+        # Scrollable rows container
+        list_wrap = tk.Frame(inner_q, bg=BG_CARD, highlightbackground=BORDER_HAIRLINE, highlightthickness=1)
+        list_wrap.pack(fill="both", expand=True)
+
+        self.queue_canvas = tk.Canvas(list_wrap, bg=BG_CARD, highlightthickness=0, height=220)
+        scrollbar = ttk.Scrollbar(list_wrap, orient="vertical", command=self.queue_canvas.yview)
+        self.queue_inner = tk.Frame(self.queue_canvas, bg=BG_CARD)
+
+        self._canvas_win_id = self.queue_canvas.create_window((0, 0), window=self.queue_inner, anchor="nw")
+        self.queue_canvas.configure(yscrollcommand=scrollbar.set)
+
+        self.queue_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        self.queue_inner.bind(
+            "<Configure>",
+            lambda _e: self.queue_canvas.configure(scrollregion=self.queue_canvas.bbox("all")),
+        )
+        self.queue_canvas.bind(
+            "<Configure>",
+            lambda e: self.queue_canvas.itemconfig(self._canvas_win_id, width=e.width),
+        )
+        self.queue_canvas.bind(
+            "<MouseWheel>",
+            lambda e: self.queue_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"),
+        )
 
         actions = tk.Frame(self.tab_status, bg=BG_CANVAS)
         actions.pack(fill="x")
@@ -1057,20 +1134,168 @@ class ControlPanelApp:
 
     def _on_clear_all_queue(self):
         self._send_daemon_command("clear_all_queue")
-        for row_id in self.tree.get_children():
-            self.tree.delete(row_id)
 
     def _on_clear_abnormal(self):
         self._send_daemon_command("clear_abnormal")
         messagebox.showinfo("已送出", "已通知背景服務清除異常項目與殘留快取。", parent=self.root)
 
+    def _on_toggle_pause(self, msg_id: int, current_status: str):
+        if current_status == "已暫停" or current_status in ("下載失敗", "移轉失敗", "解壓/移轉失敗", "移轉驗證失敗"):
+            self._send_daemon_command("resume_task", payload=str(msg_id))
+        else:
+            self._send_daemon_command("pause_task", payload=str(msg_id))
+
+    def _on_cancel_task(self, msg_id: int, name: str):
+        if not messagebox.askyesno(
+            "確認取消並移除檔案",
+            f"確定要取消「{name}」的下載嗎？\n\n"
+            "確認後將會：\n"
+            "1. 中止下載並刪除電腦上的暫存檔\n"
+            "2. 一併移除 Telegram 對話框中的該筆原檔訊息（若有刪除權限）\n"
+            "3. 立即接續下載下一個排隊檔案",
+            parent=self.root,
+        ):
+            return
+        self._send_daemon_command("cancel_task", payload=str(msg_id))
+
+    def _sync_queue_rows(self, items: list):
+        """Update queue row widgets in-place to avoid flicker or missed button clicks."""
+        desired_keys = [(int(it.get("msg_id", 0)), bool(it.get("is_completed", False))) for it in items]
+
+        if not items:
+            for w in self._row_widgets.values():
+                w["frame"].destroy()
+            self._row_widgets.clear()
+            if self._empty_row_label is None:
+                self._empty_row_label = tk.Label(
+                    self.queue_inner,
+                    text="目前佇列中無下載項目 — 傳送檔案到目標對話框即可自動開始",
+                    bg=BG_CARD, fg=TEXT_SECONDARY, font=(UI_FONT, 9), pady=28,
+                )
+                self._empty_row_label.pack(fill="x")
+            return
+
+        if self._empty_row_label is not None:
+            self._empty_row_label.destroy()
+            self._empty_row_label = None
+
+        current_keys = list(self._row_widgets.keys())
+        if current_keys != desired_keys:
+            # Rebuild rows cleanly in exact display order when membership/order changes
+            for w in self._row_widgets.values():
+                w["frame"].destroy()
+            self._row_widgets.clear()
+
+            for idx, it in enumerate(items):
+                key = (int(it.get("msg_id", 0)), bool(it.get("is_completed", False)))
+                row_bg = BG_CARD if idx % 2 == 0 else "#FAFAFC"
+                rf = tk.Frame(self.queue_inner, bg=row_bg, padx=8, pady=5)
+                rf.pack(fill="x")
+
+                lbl_name = tk.Label(rf, width=24, anchor="w", bg=row_bg, fg=TEXT_PRIMARY, font=(UI_FONT, 9))
+                lbl_size = tk.Label(rf, width=9, anchor="center", bg=row_bg, fg=TEXT_SECONDARY, font=(UI_FONT, 9))
+                lbl_prog = tk.Label(rf, width=7, anchor="center", bg=row_bg, fg=TEXT_PRIMARY, font=(UI_FONT, 9, "bold"))
+                lbl_speed = tk.Label(rf, width=15, anchor="center", bg=row_bg, fg=TEXT_SECONDARY, font=(UI_FONT, 9))
+                lbl_status = tk.Label(rf, width=14, anchor="center", bg=row_bg, font=(UI_FONT, 9, "bold"))
+                act_box = tk.Frame(rf, bg=row_bg, width=96)
+
+                lbl_name.pack(side="left", padx=2)
+                lbl_size.pack(side="left", padx=2)
+                lbl_prog.pack(side="left", padx=2)
+                lbl_speed.pack(side="left", padx=2)
+                lbl_status.pack(side="left", padx=2)
+                act_box.pack(side="left", padx=2)
+
+                btn_pause = None
+                btn_cancel = None
+                if not key[1]:
+                    btn_pause = _make_apple_button(act_box, "⏸ 暫停", lambda: None, compact=True)
+                    btn_pause.pack(side="left", padx=(0, 4))
+                    btn_cancel = _make_apple_button(act_box, "✕", lambda: None, danger=True, compact=True)
+                    btn_cancel.pack(side="left")
+
+                self._row_widgets[key] = {
+                    "frame": rf,
+                    "name": lbl_name,
+                    "size": lbl_size,
+                    "prog": lbl_prog,
+                    "speed": lbl_speed,
+                    "status": lbl_status,
+                    "btn_pause": btn_pause,
+                    "btn_cancel": btn_cancel,
+                }
+
+        # Update values in place
+        for it in items:
+            mid = int(it.get("msg_id", 0))
+            is_comp = bool(it.get("is_completed", False))
+            key = (mid, is_comp)
+            w = self._row_widgets.get(key)
+            if not w:
+                continue
+
+            raw_name = str(it.get("name", ""))
+            short_name = raw_name if len(raw_name) <= 22 else raw_name[:19] + "..."
+            status_text = str(it.get("status", ""))
+            speed = str(it.get("speed", "--"))
+            eta = str(it.get("eta", "--"))
+            speed_eta = speed if eta in ("--", "0s") else f"{speed} · {eta}"
+
+            if status_text == "下載中":
+                st_color = APPLE_BLUE
+            elif status_text == "已暫停":
+                st_color = APPLE_AMBER
+            elif is_comp or "已完成" in status_text:
+                st_color = "#157F3D"
+            elif "失敗" in status_text or "加密" in status_text:
+                st_color = APPLE_RED
+            else:
+                st_color = TEXT_SECONDARY
+
+            w["name"].config(text=short_name)
+            w["size"].config(text=format_size(int(it.get("size", 0))))
+            w["prog"].config(text=f"{float(it.get('progress', 0.0)):.1f}%")
+            w["speed"].config(text=speed_eta)
+            w["status"].config(text=status_text, fg=st_color)
+
+            if not is_comp and w["btn_pause"] is not None and w["btn_cancel"] is not None:
+                if status_text == "已暫停" or status_text in ("下載失敗", "移轉失敗", "解壓/移轉失敗", "移轉驗證失敗"):
+                    w["btn_pause"].config(
+                        text="▶ 繼續",
+                        bg="#E3F9E9",
+                        fg="#157F3D",
+                        state="normal",
+                        command=lambda m=mid, st=status_text: self._on_toggle_pause(m, st),
+                    )
+                elif status_text in ("下載中", "等待中"):
+                    w["btn_pause"].config(
+                        text="⏸ 暫停",
+                        bg=BTN_SECONDARY_BG,
+                        fg=TEXT_PRIMARY,
+                        state="normal",
+                        command=lambda m=mid, st=status_text: self._on_toggle_pause(m, st),
+                    )
+                else:
+                    w["btn_pause"].config(text="⏸ 暫停", state="disabled")
+
+                w["btn_cancel"].config(
+                    command=lambda m=mid, nm=raw_name: self._on_cancel_task(m, nm),
+                )
+
     def _poll_status(self):
+        if self._closing:
+            return
         status = read_json_safe(self.file_service.status_path, {})
         now = time.time()
         ts = float(status.get("timestamp", 0) or 0)
         alive = (now - ts) <= 4.0
         self._daemon_alive = alive
         self._daemon_version = str(status.get("version", "") or "")
+
+        raise_ts = float(status.get("raise_gui_ts", 0) or 0)
+        if raise_ts > self._last_raise_ts:
+            self._last_raise_ts = raise_ts
+            self._ensure_visible()
 
         self.file_service.load_config()
         has_creds = all(self.file_service.get_credentials())
@@ -1108,33 +1333,17 @@ class ControlPanelApp:
         else:
             self.warning_var.set("")
 
-        for row_id in self.tree.get_children():
-            self.tree.delete(row_id)
-        for item in status.get("items", []):
-            self.tree.insert(
-                "",
-                "end",
-                values=(
-                    item.get("name", ""),
-                    format_size(int(item.get("size", 0))),
-                    f"{item.get('progress', 0.0):.1f}%",
-                    item.get("speed", "--"),
-                    item.get("eta", "--"),
-                    item.get("status", ""),
-                ),
-            )
-
-        self.root.after(1000, self._poll_status)
+        self._sync_queue_rows(status.get("items", []))
+        self.root.after(800, self._poll_status)
 
     def _on_close(self):
-        self.login_bridge.shutdown()
-        self.root.destroy()
+        self._confirm_close_app()
 
     def run(self):
         self.root.mainloop()
 
 
-def run_gui(initial_tab: str = "account"):
+def run_gui(initial_tab: str = "status"):
     app = ControlPanelApp(initial_tab=initial_tab)
     app.run()
 

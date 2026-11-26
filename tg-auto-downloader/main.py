@@ -22,12 +22,12 @@ from platform_utils import (
     read_json_safe,
 )
 from queue_service import QueueService
-from tg_service import TelegramService, extract_media_info
+from tg_service import MESSAGE_CHECK_ERROR, TelegramService, extract_media_info
 from utils import format_size, get_free_disk_space, make_progress_bar
 
 
 class DaemonController:
-    """Coordinates TelegramService, QueueWorker, persistent queue recovery, IPC, and Tray Icon."""
+    """Coordinates TelegramService, QueueWorker, Pause/Cancel/Delete handling, IPC, and Tray Icon."""
 
     def __init__(self):
         self.file_service = FileService()
@@ -41,6 +41,11 @@ class DaemonController:
         self.tray_icon = None
         self._last_icon_state = None
         self._gui_process = None
+        self._raise_gui_ts = 0.0
+
+        self.current_download_msg_id = None
+        self.current_download_task = None
+        self.cancel_reasons = {}
 
     def _spawn_ui_subprocess(self, args: list):
         cmd = get_launch_command_args(args)
@@ -52,13 +57,18 @@ class DaemonController:
             kwargs["startupinfo"] = si
         return subprocess.Popen(cmd, **kwargs)
 
-    def launch_gui(self, tab: str = "account"):
+    def launch_gui(self, tab: str = "status"):
         if self._gui_process is not None and self._gui_process.poll() is None:
+            self._raise_gui_ts = time.time()
+            self._write_status_snapshot()
             return
         try:
             self._gui_process = self._spawn_ui_subprocess(["--gui", "--tab", tab])
         except Exception as e:
             print(f"[-] 無法開啟設定介面: {e}")
+
+    def open_or_raise_gui(self, tab: str = "status"):
+        self.launch_gui(tab=tab)
 
     async def prompt_required_folder_async(self) -> str:
         try:
@@ -96,8 +106,9 @@ class DaemonController:
             and self.tg_service.account_label
         )
         payload = {
-            "version": "3.2",
+            "version": "3.3",
             "timestamp": time.time(),
+            "raise_gui_ts": self._raise_gui_ts,
             "pid": os.getpid(),
             "memory_mb": round(get_memory_usage_mb(), 1),
             "client_active": self.client_active,
@@ -120,6 +131,22 @@ class DaemonController:
                 self.tray_icon.icon = create_tray_icon_image(new_state)
             except Exception:
                 pass
+
+    def _clean_task_temp_files(self, filename: str):
+        if not filename:
+            return
+        dl_dir = self.file_service.get_download_dir()
+        dest_path = os.path.join(dl_dir, filename)
+        self.file_service.safe_delete(dest_path)
+        self.file_service.safe_delete(dest_path + ".parts")
+        folder_name = os.path.splitext(filename)[0]
+        if folder_name:
+            self.file_service.safe_delete(os.path.join(dl_dir, folder_name))
+
+    def _refresh_encrypted_warning_flag(self):
+        self.has_encrypted_warning = any(
+            i.get("status") == "⚠️ 加密隔離" for i in self.queue_service.get_all_items()
+        )
 
     async def _refresh_dialogs_cache(self):
         if not self.tg_service or not self.client_active:
@@ -161,7 +188,7 @@ class DaemonController:
             )
 
     async def _restore_pending_tasks(self):
-        """Restore unfinished tasks from previous run and clean orphan temp files."""
+        """Restore unfinished/paused tasks from previous run and clean orphan temp files."""
         saved = self.queue_service.load_persisted_pending()
         for entry in saved:
             msg_id = entry.get("msg_id")
@@ -169,6 +196,7 @@ class DaemonController:
             size = int(entry.get("size", 0) or 0)
             chat_id_str = str(entry.get("chat_id", "me") or "me")
             prev_status = entry.get("status", "等待中")
+            prev_prog = float(entry.get("progress", 0.0) or 0.0)
             if not msg_id or not name:
                 continue
 
@@ -176,7 +204,7 @@ class DaemonController:
                 local_zip = os.path.join(self.file_service.get_download_dir(), name)
                 if os.path.exists(local_zip):
                     self.queue_service.add_item(
-                        msg_id, name, size, chat_id=chat_id_str, status="⚠️ 加密隔離", persist=False
+                        msg_id, name, size, chat_id=chat_id_str, status="⚠️ 加密隔離", progress=100.0, persist=False
                     )
                     self.has_encrypted_warning = True
                 continue
@@ -184,12 +212,14 @@ class DaemonController:
             chat_target = "me" if chat_id_str == "me" else (int(chat_id_str) if chat_id_str.lstrip("-").isdigit() else chat_id_str)
             msg_obj = await self.tg_service.get_message_by_id(msg_id, chat_target=chat_target)
             if msg_obj and getattr(msg_obj, "media", None):
+                restored_status = "已暫停" if prev_status == "已暫停" else "等待中"
                 self.queue_service.add_item(
-                    msg_id, name, size, chat_id=chat_id_str, status="等待中", persist=False
+                    msg_id, name, size, chat_id=chat_id_str, status=restored_status, progress=prev_prog, persist=False
                 )
                 self.queue_service.update_item(msg_id, persist=False, message_obj=msg_obj)
             else:
-                print(f"[*] 雲端訊息已不存在，略過恢復任務: {name} (ID: {msg_id})")
+                print(f"[*] 雲端訊息已不存在，略過恢復任務並清除暫存: {name} (ID: {msg_id})")
+                self._clean_task_temp_files(name)
 
         self.queue_service.persist_state()
         removed = self.file_service.clean_orphan_temp_files(self.queue_service.get_retained_filenames())
@@ -197,7 +227,6 @@ class DaemonController:
             print(f"[*] 啟動清理完成：移除 {removed} 個孤兒暫存項目。")
 
     async def _sync_missed_messages(self):
-        """Optionally catch up media messages received while app was closed."""
         chat_key = self.file_service.watch_chat_id
         last_id = self.file_service.get_last_seen_msg_id(chat_key)
 
@@ -240,6 +269,7 @@ class DaemonController:
         ok = await service.start()
         if ok:
             service.register_listener(self.handle_new_file)
+            service.register_delete_listener(self.handle_messages_deleted)
             service.register_monitor_listener(self.handle_monitor_command)
             self.tg_service = service
             self.client_active = True
@@ -257,6 +287,86 @@ class DaemonController:
             self.tg_service = None
         self.client_active = False
 
+    async def pause_task(self, msg_id: int):
+        item = self.queue_service.get_item(msg_id)
+        if not item:
+            return
+        if self.current_download_msg_id == msg_id and self.current_download_task and not self.current_download_task.done():
+            self.cancel_reasons[msg_id] = "user_pause"
+            self.current_download_task.cancel()
+        elif item.get("status") == "等待中":
+            self.queue_service.update_item(msg_id, status="已暫停", eta="--", speed="--")
+
+    async def resume_task(self, msg_id: int):
+        item = self.queue_service.get_item(msg_id)
+        if not item:
+            return
+        if item.get("status") not in ("已暫停", "下載失敗", "移轉失敗", "解壓/移轉失敗", "移轉驗證失敗"):
+            return
+
+        if not item.get("message_obj") and self.tg_service and self.client_active:
+            chat_id_str = str(item.get("chat_id", "me") or "me")
+            chat_target = "me" if chat_id_str == "me" else (int(chat_id_str) if chat_id_str.lstrip("-").isdigit() else chat_id_str)
+            msg_obj = await self.tg_service.get_message_by_id(msg_id, chat_target=chat_target)
+            if not msg_obj or not getattr(msg_obj, "media", None):
+                await self.cancel_task(msg_id, reason="tg_deleted")
+                return
+            self.queue_service.update_item(msg_id, persist=False, message_obj=msg_obj)
+
+        self.queue_service.update_item(msg_id, status="等待中", eta="計算中...", speed="--")
+
+    async def _delete_tg_on_user_cancel(self, msg_id: int, chat_id_str: str, filename: str):
+        if not self.tg_service or not self.client_active:
+            return
+        chat_target = "me" if chat_id_str == "me" else (int(chat_id_str) if chat_id_str.lstrip("-").isdigit() else chat_id_str)
+        deleted = await self.tg_service.delete_message(msg_id, chat_target=chat_target)
+        if deleted:
+            self.notify(APP_DISPLAY_NAME, f"已取消下載、清除暫存並刪除 Telegram 原檔：{filename}")
+        else:
+            self.notify(APP_DISPLAY_NAME, f"已取消下載並清除暫存（Telegram 端無權限刪除）：{filename}")
+
+    async def cancel_task(self, msg_id: int, reason: str = "user_cancel"):
+        item = self.queue_service.get_item(msg_id)
+        if not item:
+            return
+        filename = item.get("name", "")
+        chat_id_str = str(item.get("chat_id", "me") or "me")
+        if self.current_download_msg_id == msg_id and self.current_download_task and not self.current_download_task.done():
+            self.cancel_reasons[msg_id] = reason
+            self.current_download_task.cancel()
+        else:
+            self._clean_task_temp_files(filename)
+            self.queue_service.remove_item(msg_id, force_delete=True)
+            self._refresh_encrypted_warning_flag()
+            if reason == "tg_deleted":
+                self.notify(APP_DISPLAY_NAME, f"雲端檔案已被刪除，已自動取消：{filename}")
+            elif reason == "user_cancel":
+                await self._delete_tg_on_user_cancel(msg_id, chat_id_str, filename)
+
+    async def handle_messages_deleted(self, deleted_ids: list):
+        for mid in deleted_ids:
+            if self.queue_service.get_item(mid):
+                print(f"[!] 偵測到 Telegram 訊息已被刪除 (ID: {mid})，自動取消並清除暫存。")
+                await self.cancel_task(mid, reason="tg_deleted")
+
+    async def _pause_active_and_quit(self):
+        self.stop_event.set()
+        if self.current_download_msg_id is not None and self.current_download_task and not self.current_download_task.done():
+            mid = self.current_download_msg_id
+            self.cancel_reasons[mid] = "app_quit"
+            self.current_download_task.cancel()
+            try:
+                await asyncio.wait_for(self.current_download_task, timeout=4.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+            item = self.queue_service.get_item(mid)
+            if item and item.get("status") == "下載中":
+                self.queue_service.update_item(mid, status="已暫停", eta="--", speed="--")
+        self.queue_service.persist_state()
+        await self.stop_tg_client()
+        if self.tray_icon:
+            self.tray_icon.stop()
+
     def clear_abnormal_reports(self):
         self.has_encrypted_warning = False
         abnormal_statuses = {"⚠️ 加密隔離", "解壓/移轉失敗", "移轉失敗", "移轉驗證失敗", "下載失敗"}
@@ -264,9 +374,7 @@ class DaemonController:
         for item in list(self.queue_service.get_all_items()):
             if item.get("status") in abnormal_statuses:
                 msg_id = item["msg_id"]
-                temp_path = os.path.join(self.file_service.get_download_dir(), item["name"])
-                self.file_service.safe_delete(temp_path)
-                self.file_service.safe_delete(temp_path + ".parts")
+                self._clean_task_temp_files(item["name"])
                 self.queue_service.remove_item(msg_id, force_delete=True)
                 cleaned += 1
         self.file_service.clean_unfinished_files()
@@ -334,6 +442,7 @@ class DaemonController:
             pass
 
         action = cmd.get("action")
+        payload = str(cmd.get("payload", "") or "")
         if action == "stop_client":
             await self.stop_tg_client()
         elif action == "start_client":
@@ -341,7 +450,17 @@ class DaemonController:
         elif action == "refresh_dialogs":
             await self._refresh_dialogs_cache()
         elif action == "resolve_chat":
-            await self._resolve_chat_cache(str(cmd.get("payload", "")))
+            await self._resolve_chat_cache(payload)
+        elif action == "pause_task" and payload.lstrip("-").isdigit():
+            await self.pause_task(int(payload))
+        elif action == "resume_task" and payload.lstrip("-").isdigit():
+            await self.resume_task(int(payload))
+        elif action == "cancel_task" and payload.lstrip("-").isdigit():
+            await self.cancel_task(int(payload), reason="user_cancel")
+        elif action == "notify_minimized":
+            self.notify(APP_DISPLAY_NAME, "已縮到系統匣背景執行，點選或雙擊圖示可重新開啟視窗。")
+        elif action == "pause_and_quit":
+            await self._pause_active_and_quit()
         elif action == "reload_config":
             old_chat = self.file_service.watch_chat_id
             old_catch_up = self.file_service.catch_up_missed
@@ -363,7 +482,7 @@ class DaemonController:
         while not self.stop_event.is_set():
             pending = [i for i in self.queue_service.get_all_items() if i["status"] == "等待中"]
             if not pending or not self.tg_service or not self.client_active:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
                 continue
 
             target = pending[0]
@@ -373,6 +492,22 @@ class DaemonController:
                 continue
 
             async with self.queue_service.download_lock:
+                # Re-check in case user paused/cancelled while waiting for lock
+                latest_item = self.queue_service.get_item(msg_id)
+                if not latest_item or latest_item.get("status") != "等待中":
+                    continue
+
+                chat_id_str = str(target.get("chat_id", "me") or "me")
+                chat_target = "me" if chat_id_str == "me" else (int(chat_id_str) if chat_id_str.lstrip("-").isdigit() else chat_id_str)
+
+                # Pre-check if queued file was deleted on Telegram before starting download
+                exists_before = await self.tg_service.check_message_exists(msg_id, chat_target=chat_target)
+                if exists_before is False:
+                    self._clean_task_temp_files(target["name"])
+                    self.queue_service.remove_item(msg_id, force_delete=True)
+                    self.notify(APP_DISPLAY_NAME, f"Telegram 雲端檔案已被刪除，已略過並清除暫存：{target['name']}")
+                    continue
+
                 self.queue_service.update_item(msg_id, status="下載中")
                 self.file_service.ensure_dir_exists(self.file_service.get_download_dir())
                 dest_path = os.path.join(self.file_service.get_download_dir(), target["name"])
@@ -402,8 +537,60 @@ class DaemonController:
                         msg_id, persist=False, progress=pct, eta=eta, received_bytes=received, speed=speed_str
                     )
 
-                success = await self.tg_service.download_file(target["message_obj"], dest_path, on_progress)
+                self.current_download_msg_id = msg_id
+                self.current_download_task = asyncio.create_task(
+                    self.tg_service.download_file(target["message_obj"], dest_path, on_progress)
+                )
+
+                async def watch_tg_deletion():
+                    while not self.current_download_task.done() and not self.stop_event.is_set():
+                        await asyncio.sleep(5)
+                        if self.current_download_task.done() or not self.tg_service or not self.client_active:
+                            break
+                        exists = await self.tg_service.check_message_exists(msg_id, chat_target=chat_target)
+                        if exists is False:
+                            print(f"[!] 輪詢確認 Telegram 訊息已被刪除 (ID: {msg_id})，立即中止下載。")
+                            self.cancel_reasons[msg_id] = "tg_deleted"
+                            self.current_download_task.cancel()
+                            break
+
+                del_watcher = asyncio.create_task(watch_tg_deletion())
+                try:
+                    success = await self.current_download_task
+                except asyncio.CancelledError:
+                    success = False
+                finally:
+                    del_watcher.cancel()
+                    try:
+                        await del_watcher
+                    except asyncio.CancelledError:
+                        pass
+                    self.current_download_msg_id = None
+                    self.current_download_task = None
+
+                reason = self.cancel_reasons.pop(msg_id, None)
+                if reason in ("user_cancel", "tg_deleted"):
+                    self._clean_task_temp_files(target["name"])
+                    self.queue_service.remove_item(msg_id, force_delete=True)
+                    if reason == "tg_deleted":
+                        self.notify(APP_DISPLAY_NAME, f"Telegram 雲端檔案已被刪除，已取消下載並清除暫存：{target['name']}")
+                    elif reason == "user_cancel":
+                        await self._delete_tg_on_user_cancel(msg_id, chat_id_str, target["name"])
+                    continue
+
+                if reason in ("user_pause", "app_quit"):
+                    self.queue_service.update_item(msg_id, status="已暫停", eta="--", speed="--")
+                    continue
+
                 if not success:
+                    # Check if failure occurred because TG deleted the message mid-transfer
+                    if self.tg_service and self.client_active:
+                        exists = await self.tg_service.check_message_exists(msg_id, chat_target=chat_target)
+                        if exists is False:
+                            self._clean_task_temp_files(target["name"])
+                            self.queue_service.remove_item(msg_id, force_delete=True)
+                            self.notify(APP_DISPLAY_NAME, f"Telegram 雲端檔案已被刪除，已取消下載並清除暫存：{target['name']}")
+                            continue
                     self.queue_service.update_item(msg_id, status="下載失敗", eta="--")
                     continue
 
@@ -466,8 +653,6 @@ class DaemonController:
 
                 expected_size = -1 if is_zip else target["size"]
                 if self.file_service.verify_moved_file(final_dest, expected_size):
-                    chat_id_str = str(target.get("chat_id", "me") or "me")
-                    chat_target = "me" if chat_id_str == "me" else (int(chat_id_str) if chat_id_str.lstrip("-").isdigit() else chat_id_str)
                     if self.file_service.delete_after_transfer and self.tg_service:
                         deleted = await self.tg_service.delete_message(msg_id, chat_target=chat_target)
                         status_label = "已完成並清理" if deleted else "已完成移轉(無刪除權限)"
@@ -486,7 +671,7 @@ class DaemonController:
         while not self.stop_event.is_set():
             await self._process_commands()
             self._write_status_snapshot()
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.4)
 
     async def async_main(self):
         self.stop_event = asyncio.Event()
@@ -509,13 +694,9 @@ class DaemonController:
 
     def stop_all(self):
         if self.loop and self.stop_event:
-            async def _shutdown():
-                self.stop_event.set()
-                await self.stop_tg_client()
-
-            fut = asyncio.run_coroutine_threadsafe(_shutdown(), self.loop)
+            fut = asyncio.run_coroutine_threadsafe(self._pause_active_and_quit(), self.loop)
             try:
-                fut.result(timeout=5)
+                fut.result(timeout=6)
             except Exception:
                 pass
         if self.tray_icon:
@@ -526,7 +707,7 @@ class DaemonController:
             return f"狀態: 已連線 {self.tg_service.account_label}"
         api_id, api_hash = self.file_service.get_credentials()
         if not api_id or not api_hash or not self.file_service.has_session_file():
-            return "狀態: 尚未設定帳號（請點「控制面板」）"
+            return "狀態: 尚未設定帳號（請開啟控制面板）"
         return "狀態: 未連線"
 
     def _tray_queue_label(self, _item) -> str:
@@ -539,20 +720,25 @@ class DaemonController:
     def run_tray(self):
         self.start_background_loop()
 
+        # Default behavior on launch: ALWAYS open the Control Panel window
         api_id, api_hash = self.file_service.get_credentials()
         needs_setup = not api_id or not api_hash or not self.file_service.has_session_file()
         if needs_setup:
             self.launch_gui("account")
         elif not self.file_service.is_dir_accessible(self.file_service.get_shipping_dir()):
             self._spawn_ui_subprocess(["--pick-required-folder"])
+            self.launch_gui("status")
+        else:
+            self.launch_gui("status")
 
         menu = pystray.Menu(
+            pystray.MenuItem("開啟控制面板", lambda icon, item: self.open_or_raise_gui("status"), default=True),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem(self._tray_status_label, None, enabled=False),
             pystray.MenuItem(self._tray_queue_label, None, enabled=False),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("開啟控制面板 / 帳號與對話框設定...", lambda icon, item: self.launch_gui("account")),
-            pystray.MenuItem("對話框與同步資料夾設定...", lambda icon, item: self.launch_gui("settings")),
-            pystray.MenuItem("查看下載佇列與狀態...", lambda icon, item: self.launch_gui("status")),
+            pystray.MenuItem("帳號與登入設定...", lambda icon, item: self.open_or_raise_gui("account")),
+            pystray.MenuItem("對話框與同步資料夾設定...", lambda icon, item: self.open_or_raise_gui("settings")),
             pystray.MenuItem("一鍵清除佇列與歷史", lambda icon, item: self.clear_all_queue_and_history()),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("結束程式", lambda icon, item: self.stop_all()),
@@ -582,7 +768,7 @@ def main():
     parser = argparse.ArgumentParser(description=APP_DISPLAY_NAME)
     parser.add_argument("--gui", action="store_true", help="Open control panel GUI window")
     parser.add_argument("--pick-required-folder", action="store_true", help="Prompt user to choose an accessible destination folder")
-    parser.add_argument("--tab", default="account", choices=["account", "settings", "status"])
+    parser.add_argument("--tab", default="status", choices=["account", "settings", "status"])
     args = parser.parse_args()
 
     if args.pick_required_folder:

@@ -1,4 +1,4 @@
-"""Cross-platform Telegram MTProto client service supporting custom chats, catch-up, and parallel downloads."""
+"""Cross-platform Telegram MTProto client service supporting custom chats, deletion detection, and parallel downloads."""
 
 import asyncio
 import logging
@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import aiofiles
 from telethon import TelegramClient, events
+from telethon.errors import FileReferenceExpiredError, MediaEmptyError, MessageIdInvalidError
 from telethon.tl.types import (
     DocumentAttributeFilename,
     MessageMediaDocument,
@@ -22,6 +23,8 @@ MULTI_PART_THRESHOLD = 50 * 1024 * 1024  # >= 50 MB uses 4-worker parallel downl
 NUM_WORKERS = 4
 MAX_RETRY_PER_PART = 3
 WATCHDOG_TIMEOUT = 60
+
+MESSAGE_CHECK_ERROR = object()
 
 
 def setup_logger(log_path: str) -> logging.Logger:
@@ -65,12 +68,10 @@ def parse_chat_reference(raw: str) -> Union[str, int]:
     if not text or text.lower() in ("me", "saved", "我的收藏"):
         return "me"
 
-    # Private supergroup/channel message link: https://t.me/c/1234567890/55 -> -1001234567890
     m_private = re.search(r"t\.me/c/(\d+)(?:/\d+)?", text, re.IGNORECASE)
     if m_private:
         return int(f"-100{m_private.group(1)}")
 
-    # Public link: https://t.me/username or https://t.me/username/123
     m_public = re.search(r"t\.me/([A-Za-z0-9_]{3,})(?:/\d+)?", text, re.IGNORECASE)
     if m_public:
         slug = m_public.group(1)
@@ -112,7 +113,7 @@ def extract_media_info(message, max_size_bytes: int = 4 * 1024 * 1024 * 1024) ->
 
 
 class TelegramService:
-    """Handles Telegram chat listening, dialog listing, catch-up, parallel downloading, and cleanup."""
+    """Handles Telegram chat listening, deletion events, dialog listing, and parallel downloading."""
 
     def __init__(
         self,
@@ -134,10 +135,12 @@ class TelegramService:
 
         self.on_monitor_cmd = None
         self.on_new_file_callback = None
+        self.on_deleted_callback = None
         self.liveness_task = None
         self.account_label = ""
         self.last_error = ""
         self._handler_ref = None
+        self._delete_handler_ref = None
 
         self.log.info(f"=== TG Auto Downloader 啟動 (api_id={api_id}, watch_chat={self.watch_chat}) ===")
         self.client = self._build_client()
@@ -177,7 +180,6 @@ class TelegramService:
             self.last_error = ""
             self.log.info(f"✓ Telegram 連線成功！登入帳號: {self.account_label}")
 
-            # Warm entity cache for non-'me' dialogs
             try:
                 await self.client.get_dialogs(limit=80)
             except Exception:
@@ -231,6 +233,8 @@ class TelegramService:
 
         if self.on_new_file_callback:
             self._bind_listener()
+        if self.on_deleted_callback:
+            self._bind_delete_listener()
 
     async def _liveness_check_loop(self):
         self.log.info("背景連線活性檢查已啟動。")
@@ -252,7 +256,6 @@ class TelegramService:
                     self.log.error(f"[活性檢查] 重連失敗: {re_err}")
 
     def set_watch_chat(self, watch_chat: Union[str, int]):
-        """Switch monitored chat dynamically and rebind event listener."""
         self.watch_chat = watch_chat if watch_chat else "me"
         self.log.info(f"切換監聽對話框為: {self.watch_chat}")
         if self.on_new_file_callback:
@@ -261,6 +264,10 @@ class TelegramService:
     def register_listener(self, on_new_file):
         self.on_new_file_callback = on_new_file
         self._bind_listener()
+
+    def register_delete_listener(self, on_deleted):
+        self.on_deleted_callback = on_deleted
+        self._bind_delete_listener()
 
     def register_monitor_listener(self, on_monitor_cmd):
         self.on_monitor_cmd = on_monitor_cmd
@@ -297,8 +304,23 @@ class TelegramService:
 
         self._handler_ref = handler
 
+    def _bind_delete_listener(self):
+        if self._delete_handler_ref is not None:
+            try:
+                self.client.remove_event_handler(self._delete_handler_ref)
+            except Exception:
+                pass
+            self._delete_handler_ref = None
+
+        @self.client.on(events.MessageDeleted())
+        async def delete_handler(event):
+            deleted_ids = list(getattr(event, "deleted_ids", []) or [])
+            if deleted_ids and self.on_deleted_callback:
+                await self.on_deleted_callback(deleted_ids)
+
+        self._delete_handler_ref = delete_handler
+
     async def fetch_dialogs(self, limit: int = 80) -> List[Dict[str, str]]:
-        """List user's Telegram dialogs with Saved Messages always first."""
         results: List[Dict[str, str]] = [
             {
                 "id": "me",
@@ -327,7 +349,6 @@ class TelegramService:
         return results
 
     async def resolve_chat_reference(self, raw_input: str) -> Dict[str, str]:
-        """Resolve a pasted link, @username, or chat ID into canonical id and display title."""
         parsed = parse_chat_reference(raw_input)
         if parsed == "me":
             return {"id": "me", "title": "我的收藏 (Saved Messages)"}
@@ -344,11 +365,23 @@ class TelegramService:
     async def get_message_by_id(self, msg_id: int, chat_target: Optional[Union[str, int]] = None):
         target = chat_target if chat_target is not None else self.watch_chat
         try:
-            msg = await self.client.get_messages(target, ids=msg_id)
-            return msg
+            return await self.client.get_messages(target, ids=msg_id)
         except Exception as e:
             self.log.warning(f"無法取回 Telegram 訊息 (chat={target}, ID={msg_id}): {e}")
             return None
+
+    async def check_message_exists(self, msg_id: int, chat_target: Optional[Union[str, int]] = None) -> Union[bool, object]:
+        """Return True if message still exists with media, False if definitively deleted, or MESSAGE_CHECK_ERROR."""
+        target = chat_target if chat_target is not None else self.watch_chat
+        try:
+            msg = await asyncio.wait_for(self.client.get_messages(target, ids=msg_id), timeout=10)
+            if msg is None or not getattr(msg, "media", None):
+                return False
+            return True
+        except (MessageIdInvalidError, MediaEmptyError):
+            return False
+        except Exception:
+            return MESSAGE_CHECK_ERROR
 
     async def get_latest_message_id(self, chat_target: Optional[Union[str, int]] = None) -> int:
         target = chat_target if chat_target is not None else self.watch_chat
@@ -361,7 +394,6 @@ class TelegramService:
         return 0
 
     async def fetch_missed_media_messages(self, min_id: int, limit: int = 50) -> List[Any]:
-        """Fetch media messages posted in watch_chat after min_id."""
         collected = []
         try:
             async for msg in self.client.iter_messages(
@@ -377,6 +409,7 @@ class TelegramService:
         return collected
 
     async def download_file(self, message, dest_path: str, progress_callback) -> bool:
+        """Select single-stream or 4-worker parallel download; propagates CancelledError cleanly."""
         try:
             media = message.media
             if isinstance(media, MessageMediaDocument):
@@ -396,6 +429,11 @@ class TelegramService:
             if use_multipart:
                 return await self._multipart_download(message, dest_path, total_size, progress_callback)
             return await self._single_stream_download(message, dest_path, total_size, progress_callback)
+        except asyncio.CancelledError:
+            raise
+        except (MessageIdInvalidError, MediaEmptyError, FileReferenceExpiredError) as e:
+            self.log.warning(f"下載來源訊息失效或已被刪除 (ID {message.id}): {e}")
+            return False
         except Exception as e:
             self.log.error(f"下載失敗 (ID {message.id}): {e}", exc_info=True)
             return False
@@ -548,30 +586,46 @@ class TelegramService:
         return success
 
     async def _run_with_watchdog(self, coro_func, get_last_progress_time, msg_id: int) -> bool:
+        task = asyncio.create_task(coro_func())
+        watchdog_triggered = False
+
+        async def watchdog():
+            nonlocal watchdog_triggered
+            while not task.done():
+                await asyncio.sleep(5)
+                if time.time() - get_last_progress_time() > WATCHDOG_TIMEOUT:
+                    watchdog_triggered = True
+                    task.cancel()
+                    self.log.warning(f"看門狗觸發：{WATCHDOG_TIMEOUT}s 無數據，已取消任務 (ID {msg_id})")
+
+        wdog = asyncio.create_task(watchdog())
         try:
-            task = asyncio.create_task(coro_func())
-
-            async def watchdog():
-                while not task.done():
-                    await asyncio.sleep(5)
-                    if time.time() - get_last_progress_time() > WATCHDOG_TIMEOUT:
-                        task.cancel()
-                        self.log.warning(f"看門狗觸發：{WATCHDOG_TIMEOUT}s 無數據，已取消任務 (ID {msg_id})")
-
-            wdog = asyncio.create_task(watchdog())
-            try:
-                await task
-                wdog.cancel()
-                return True
-            except asyncio.CancelledError:
+            await task
+            return True
+        except asyncio.CancelledError:
+            if watchdog_triggered:
+                self.log.warning(f"下載任務已被看門狗取消 (ID {msg_id})")
                 return False
-            except RuntimeError as e:
-                self.log.error(f"下載任務錯誤 (ID {msg_id}): {e}")
-                wdog.cancel()
-                return False
+            # External cancel/pause: cancel inner task and await its cleanup before propagating
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            raise
+        except RuntimeError as e:
+            self.log.error(f"下載任務錯誤 (ID {msg_id}): {e}")
+            return False
         except Exception as e:
             self.log.error(f"下載失敗 (ID {msg_id}): {e}", exc_info=True)
             return False
+        finally:
+            wdog.cancel()
+            try:
+                await wdog
+            except asyncio.CancelledError:
+                pass
 
     async def delete_message(self, message_id: int, chat_target: Optional[Union[str, int]] = None) -> bool:
         target = chat_target if chat_target is not None else self.watch_chat

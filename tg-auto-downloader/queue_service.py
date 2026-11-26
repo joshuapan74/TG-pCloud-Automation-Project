@@ -31,7 +31,7 @@ class QueueService:
         }
 
     def persist_state(self):
-        """Persist active/pending/quarantined tasks to disk (no message_obj)."""
+        """Persist active/pending/paused/quarantined tasks to disk (without message_obj)."""
         if not self.state_path:
             return
         pending = [
@@ -59,6 +59,7 @@ class QueueService:
         size: int,
         chat_id: str = "me",
         status: str = "等待中",
+        progress: float = 0.0,
         persist: bool = True,
     ) -> Dict[str, Any]:
         """Add a new file download task to the queue."""
@@ -69,7 +70,7 @@ class QueueService:
                 "size": size,
                 "chat_id": str(chat_id),
                 "status": status,
-                "progress": 0.0,
+                "progress": float(progress),
                 "speed": "--",
                 "eta": "計算中..." if status == "等待中" else "--",
                 "received_bytes": 0,
@@ -129,13 +130,13 @@ class QueueService:
         return sum(1 for item in self.items.values() if item["status"] == "等待中")
 
     def get_retained_filenames(self) -> Set[str]:
-        """Return filenames that still belong to active or quarantined queue items."""
+        """Return filenames that still belong to active, paused, or quarantined queue items."""
         return {item["name"] for item in self.items.values() if not item.get("is_completed")}
 
     def get_all_items(self) -> List[Dict[str, Any]]:
         return [self.items[msg_id] for msg_id in self.order if msg_id in self.items]
 
     def get_serializable_items(self) -> List[Dict[str, Any]]:
-        """Return active items plus recent completed history without non-JSON objects."""
+        """Return active/paused items plus recent completed history without non-JSON objects."""
         active = [self._serialize_item(item) for item in self.get_all_items()]
         return active + list(self.history)

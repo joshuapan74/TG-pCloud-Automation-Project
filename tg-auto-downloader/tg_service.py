@@ -1,6 +1,8 @@
 """Cross-platform Telegram MTProto client service supporting custom chats, deletion detection, and parallel downloads."""
 
 import asyncio
+import ctypes
+import glob
 import logging
 import os
 import re
@@ -25,6 +27,128 @@ MAX_RETRY_PER_PART = 3
 WATCHDOG_TIMEOUT = 60
 
 MESSAGE_CHECK_ERROR = object()
+
+
+def enable_fast_telethon_crypto() -> str:
+    """
+    Bind Python/OS bundled OpenSSL libcrypto AES-IGE functions into telethon.crypto.libssl
+    when cryptg and system libssl are unavailable, avoiding slow pure-Python pyaes loops.
+    """
+    try:
+        from telethon.crypto import aes, libssl
+    except Exception:
+        return "unavailable"
+
+    if getattr(aes, "cryptg", None) is not None:
+        return "cryptg"
+    if getattr(libssl, "decrypt_ige", None) is not None and getattr(libssl, "encrypt_ige", None) is not None:
+        return "libssl"
+
+    search_dirs: List[str] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        search_dirs.append(meipass)
+    try:
+        import _ssl
+        search_dirs.append(os.path.dirname(_ssl.__file__))
+    except Exception:
+        pass
+    search_dirs.extend([
+        os.path.join(sys.base_prefix, "DLLs"),
+        os.path.join(sys.base_prefix, "lib"),
+        os.path.dirname(sys.executable),
+    ])
+    if sys.platform == "darwin":
+        search_dirs.extend([
+            "/opt/homebrew/opt/openssl@3/lib",
+            "/usr/local/opt/openssl@3/lib",
+            "/opt/homebrew/lib",
+            "/usr/local/lib",
+        ])
+
+    patterns = ["libcrypto-3*.dll", "libcrypto*.dll"] if sys.platform == "win32" else (
+        ["libcrypto*.dylib"] if sys.platform == "darwin" else ["libcrypto.so*"]
+    )
+
+    seen = set()
+    candidates: List[str] = []
+    for d in search_dirs:
+        if not d or d in seen or not os.path.isdir(d):
+            continue
+        seen.add(d)
+        for pat in patterns:
+            candidates.extend(sorted(glob.glob(os.path.join(d, pat))))
+
+    class _AESKey(ctypes.Structure):
+        _fields_ = [("rd_key", ctypes.c_uint32 * 60), ("rounds", ctypes.c_uint)]
+
+    for path in candidates:
+        try:
+            lib = ctypes.CDLL(path)
+            if not (
+                hasattr(lib, "AES_set_encrypt_key")
+                and hasattr(lib, "AES_set_decrypt_key")
+                and hasattr(lib, "AES_ige_encrypt")
+            ):
+                continue
+
+            lib.AES_set_encrypt_key.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(_AESKey)]
+            lib.AES_set_encrypt_key.restype = ctypes.c_int
+            lib.AES_set_decrypt_key.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(_AESKey)]
+            lib.AES_set_decrypt_key.restype = ctypes.c_int
+            lib.AES_ige_encrypt.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+                ctypes.c_size_t,
+                ctypes.POINTER(_AESKey),
+                ctypes.c_char_p,
+                ctypes.c_int,
+            ]
+            lib.AES_ige_encrypt.restype = None
+
+            def _make_encrypt(clibrary):
+                def _encrypt_ige(plain_text: bytes, key: bytes, iv: bytes) -> bytes:
+                    pad = len(plain_text) % 16
+                    if pad:
+                        plain_text += os.urandom(16 - pad)
+                    ak = _AESKey()
+                    clibrary.AES_set_encrypt_key(key, 8 * len(key), ctypes.byref(ak))
+                    iv_buf = ctypes.create_string_buffer(iv, len(iv))
+                    out_buf = ctypes.create_string_buffer(len(plain_text))
+                    clibrary.AES_ige_encrypt(plain_text, out_buf, len(plain_text), ctypes.byref(ak), iv_buf, 1)
+                    return out_buf.raw
+                return _encrypt_ige
+
+            def _make_decrypt(clibrary):
+                def _decrypt_ige(cipher_text: bytes, key: bytes, iv: bytes) -> bytes:
+                    ak = _AESKey()
+                    clibrary.AES_set_decrypt_key(key, 8 * len(key), ctypes.byref(ak))
+                    iv_buf = ctypes.create_string_buffer(iv, len(iv))
+                    out_buf = ctypes.create_string_buffer(len(cipher_text))
+                    clibrary.AES_ige_encrypt(cipher_text, out_buf, len(cipher_text), ctypes.byref(ak), iv_buf, 0)
+                    return out_buf.raw
+                return _decrypt_ige
+
+            enc_fn = _make_encrypt(lib)
+            dec_fn = _make_decrypt(lib)
+
+            # Quick roundtrip sanity check before binding globally
+            test_key = b"0123456789abcdef0123456789abcdef"
+            test_iv = b"fedcba9876543210fedcba9876543210"
+            test_msg = b"TGAutoDownloader"
+            if dec_fn(enc_fn(test_msg, test_key, test_iv), test_key, test_iv) != test_msg:
+                continue
+
+            libssl.encrypt_ige = enc_fn
+            libssl.decrypt_ige = dec_fn
+            return f"libcrypto:{os.path.basename(path)}"
+        except Exception:
+            continue
+
+    return "pyaes"
+
+
+CRYPTO_BACKEND = enable_fast_telethon_crypto()
 
 
 def setup_logger(log_path: str) -> logging.Logger:
@@ -142,7 +266,7 @@ class TelegramService:
         self._handler_ref = None
         self._delete_handler_ref = None
 
-        self.log.info(f"=== TG Auto Downloader 啟動 (api_id={api_id}, watch_chat={self.watch_chat}) ===")
+        self.log.info(f"=== TG Auto Downloader 啟動 (api_id={api_id}, watch_chat={self.watch_chat}, crypto={CRYPTO_BACKEND}) ===")
         self.client = self._build_client()
 
     def _build_client(self) -> TelegramClient:

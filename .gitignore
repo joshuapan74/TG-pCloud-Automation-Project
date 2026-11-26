@@ -1,0 +1,33 @@
+# Sensitive personal files (NEVER commit)
+password.txt
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+config.json
+!config.example.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Build & Packaging artifacts
+build/
+dist/
+*.spec
+*.egg-info/
+
+# Logs & Runtime
+*.log
+spindump*.txt
+
+# OS metadata
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
